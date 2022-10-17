@@ -26,7 +26,8 @@ import           PlutusTx             (Data (..))
 import qualified PlutusTx
 import           PlutusTx.Prelude     hiding (Semigroup(..), unless)
 import           Ledger               hiding (singleton)
-import           Ledger.Constraints   as Constraints
+import           Ledger.Constraints   (TxConstraints)
+import qualified Ledger.Constraints   as Constraints
 import qualified Ledger.Typed.Scripts as Scripts
 import           Ledger.Ada           as Ada
 import           Playground.Contract  (printJson, printSchemas, ensureKnownCurrencies, stage, ToSchema)
@@ -36,7 +37,7 @@ import           Prelude              (IO, Semigroup (..), Show (..), String)
 import           Text.Printf          (printf)
 
 data VestingParam = VestingParam
-    { beneficiary :: PubKeyHash
+    { beneficiary :: PaymentPubKeyHash
     , deadline    :: POSIXTime
     } deriving Show
 
@@ -51,7 +52,7 @@ mkValidator p () () ctx = traceIfFalse "beneficiary's signature missing" signedB
     info = scriptContextTxInfo ctx
 
     signedByBeneficiary :: Bool
-    signedByBeneficiary = txSignedBy info $ beneficiary p
+    signedByBeneficiary = txSignedBy info $ unPaymentPubKeyHash $ beneficiary p
 
     deadlineReached :: Bool
     deadlineReached = contains (from $ deadline p) $ txInfoValidRange info
@@ -78,7 +79,7 @@ scrAddress :: VestingParam -> Ledger.Address
 scrAddress = scriptAddress . validator
 
 data GiveParams = GiveParams
-    { gpBeneficiary :: !PubKeyHash
+    { gpBeneficiary :: !PaymentPubKeyHash
     , gpDeadline    :: !POSIXTime
     , gpAmount      :: !Integer
     } deriving (Generic, ToJSON, FromJSON, ToSchema)
@@ -93,9 +94,9 @@ give gp = do
                 { beneficiary = gpBeneficiary gp
                 , deadline    = gpDeadline gp
                 }
-        tx = mustPayToTheScript () $ Ada.lovelaceValueOf $ gpAmount gp
+        tx = Constraints.mustPayToTheScript () $ Ada.lovelaceValueOf $ gpAmount gp
     ledgerTx <- submitTxConstraints (typedValidator p) tx
-    void $ awaitTxConfirmed $ txId ledgerTx
+    void $ awaitTxConfirmed $ getCardanoTxId ledgerTx
     logInfo @String $ printf "made a gift of %d lovelace to %s with deadline %s"
         (gpAmount gp)
         (show $ gpBeneficiary gp)
@@ -104,7 +105,7 @@ give gp = do
 grab :: forall w s e. AsContractError e => POSIXTime -> Contract w s e ()
 grab d = do
     now   <- currentTime
-    pkh   <- pubKeyHash <$> ownPubKey
+    pkh   <- ownPaymentPubKeyHash
     if now < d
         then logInfo @String $ "too early"
         else do
@@ -112,7 +113,7 @@ grab d = do
                         { beneficiary = pkh
                         , deadline    = d
                         }
-            utxos <- utxoAt $ scrAddress p
+            utxos <- utxosAt $ scrAddress p
             if Map.null utxos
                 then logInfo @String $ "no gifts available"
                 else do
@@ -120,17 +121,17 @@ grab d = do
                         lookups = Constraints.unspentOutputs utxos      <>
                                   Constraints.otherScript (validator p)
                         tx :: TxConstraints Void Void
-                        tx      = mconcat [mustSpendScriptOutput oref $ Redeemer $ PlutusTx.toData () | oref <- orefs] <>
-                                  mustValidateIn (from now)
+                        tx      = mconcat [Constraints.mustSpendScriptOutput oref unitRedeemer | oref <- orefs] <>
+                                  Constraints.mustValidateIn (from now)
                     ledgerTx <- submitTxConstraintsWith @Void lookups tx
-                    void $ awaitTxConfirmed $ txId ledgerTx
+                    void $ awaitTxConfirmed $ getCardanoTxId ledgerTx
                     logInfo @String $ "collected gifts"
 
 endpoints :: Contract () VestingSchema Text ()
-endpoints = (give' `select` grab') >> endpoints
+endpoints = awaitPromise (give' `select` grab') >> endpoints
   where
-    give' = endpoint @"give" >>= give
-    grab' = endpoint @"grab" >>= grab
+    give' = endpoint @"give" give
+    grab' = endpoint @"grab" grab
 
 mkSchemaDefinitions ''VestingSchema
 

@@ -1,6 +1,6 @@
 cradle:
   cabal:
-    - path: "./app/uniswap-pab.hs"
-      component: "exe:uniswap-pab"
-    - path: "./app/uniswap-client.hs"
-      component: "exe:uniswap-client"
+    - path: "./src"
+      component: "lib:plutus-pioneer-program-week10"
+    - path: "./app/write-stake-validator.hs"
+      component: "exe:write-stake-validator"

@@ -13,9 +13,11 @@
 module Week05.NFT where
 
 import           Control.Monad          hiding (fmap)
+import           Data.Aeson             (FromJSON, ToJSON)
 import qualified Data.Map               as Map
 import           Data.Text              (Text)
 import           Data.Void              (Void)
+import           GHC.Generics           (Generic)
 import           Plutus.Contract        as Contract
 import           Plutus.Trace.Emulator  as Emulator
 import qualified PlutusTx
@@ -24,9 +26,6 @@ import           Ledger                 hiding (mint, singleton)
 import           Ledger.Constraints     as Constraints
 import qualified Ledger.Typed.Scripts   as Scripts
 import           Ledger.Value           as Value
-import           Playground.Contract    (printJson, printSchemas, ensureKnownCurrencies, stage, ToSchema)
-import           Playground.TH          (mkKnownCurrencies, mkSchemaDefinitions)
-import           Playground.Types       (KnownCurrency (..))
 import           Prelude                (IO, Semigroup (..), Show (..), String)
 import           Text.Printf            (printf)
 import           Wallet.Emulator.Wallet
@@ -43,9 +42,9 @@ mkPolicy oref tn () ctx = traceIfFalse "UTxO not consumed"   hasUTxO           &
     hasUTxO = any (\i -> txInInfoOutRef i == oref) $ txInfoInputs info
 
     checkMintedAmount :: Bool
-    checkMintedAmount = case flattenValue (txInfoForge info) of
-        [(cs, tn', amt)] -> cs  == ownCurrencySymbol ctx && tn' == tn && amt == 1
-        _                -> False
+    checkMintedAmount = case flattenValue (txInfoMint info) of
+        [(_, tn', amt)] -> tn' == tn && amt == 1
+        _               -> False
 
 policy :: TxOutRef -> TokenName -> Scripts.MintingPolicy
 policy oref tn = mkMintingPolicyScript $
@@ -58,36 +57,45 @@ policy oref tn = mkMintingPolicyScript $
 curSymbol :: TxOutRef -> TokenName -> CurrencySymbol
 curSymbol oref tn = scriptCurrencySymbol $ policy oref tn
 
-type NFTSchema = Endpoint "mint" TokenName
+data NFTParams = NFTParams
+    { npToken   :: !TokenName
+    , npAddress :: !Address
+    } deriving (Generic, FromJSON, ToJSON, Show)
 
-mint :: TokenName -> Contract w NFTSchema Text ()
-mint tn = do
-    pk    <- Contract.ownPubKey
-    utxos <- utxoAt (pubKeyAddress pk)
+type NFTSchema = Endpoint "mint" NFTParams
+
+mint :: NFTParams -> Contract w NFTSchema Text ()
+mint np = do
+    utxos <- utxosAt $ npAddress np
     case Map.keys utxos of
         []       -> Contract.logError @String "no utxo found"
         oref : _ -> do
+            let tn      = npToken np
             let val     = Value.singleton (curSymbol oref tn) tn 1
                 lookups = Constraints.mintingPolicy (policy oref tn) <> Constraints.unspentOutputs utxos
                 tx      = Constraints.mustMintValue val <> Constraints.mustSpendPubKeyOutput oref
             ledgerTx <- submitTxConstraintsWith @Void lookups tx
-            void $ awaitTxConfirmed $ txId ledgerTx
+            void $ awaitTxConfirmed $ getCardanoTxId ledgerTx
             Contract.logInfo @String $ printf "forged %s" (show val)
 
 endpoints :: Contract () NFTSchema Text ()
 endpoints = mint' >> endpoints
   where
-    mint' = endpoint @"mint" >>= mint
-
-mkSchemaDefinitions ''NFTSchema
-
-mkKnownCurrencies []
+    mint' = awaitPromise $ endpoint @"mint" mint
 
 test :: IO ()
 test = runEmulatorTraceIO $ do
     let tn = "ABC"
-    h1 <- activateContractWallet (Wallet 1) endpoints
-    h2 <- activateContractWallet (Wallet 2) endpoints
-    callEndpoint @"mint" h1 tn
-    callEndpoint @"mint" h2 tn
+        w1 = knownWallet 1
+        w2 = knownWallet 2
+    h1 <- activateContractWallet w1 endpoints
+    h2 <- activateContractWallet w2 endpoints
+    callEndpoint @"mint" h1 $ NFTParams
+        { npToken   = tn
+        , npAddress = mockWalletAddress w1
+        }
+    callEndpoint @"mint" h2 $ NFTParams
+        { npToken   = tn
+        , npAddress = mockWalletAddress w2
+        }
     void $ Emulator.waitNSlots 1

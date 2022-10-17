@@ -10,18 +10,23 @@ License-files:       LICENSE
 
 library
   hs-source-dirs:      src
-  exposed-modules:     Week08.Lens
+  exposed-modules:     Plutus.Contract.Test.Coverage.ReportCoverage
+                     , Week08.Lens
                      , Week08.QuickCheck
                      , Week08.TokenSale
+                     , Week08.TokenSaleFixed
                      , Week08.TokenSaleWithClose
   build-depends:       aeson
+                     , ansi-terminal
                      , base ^>=4.14.1.0
                      , containers
+                     , html-entities
                      , lens
                      , playground-common
                      , plutus-contract
                      , plutus-ledger
                      , plutus-ledger-api
+                     , plutus-ledger-constraints
                      , plutus-tx-plugin
                      , plutus-tx
                      , plutus-use-cases
@@ -52,6 +57,7 @@ test-suite plutus-pioneer-program-week08-tests
                      , plutus-tx
                      , QuickCheck
                      , tasty
+                     , tasty-hunit
                      , tasty-quickcheck
                      , text
   if !(impl(ghcjs) || os(ghcjs))

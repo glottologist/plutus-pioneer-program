@@ -38,8 +38,8 @@ import           Prelude              (Semigroup (..), Show (..), String)
 import qualified Prelude
 
 data Game = Game
-    { gFirst          :: !PubKeyHash
-    , gSecond         :: !PubKeyHash
+    { gFirst          :: !PaymentPubKeyHash
+    , gSecond         :: !PaymentPubKeyHash
     , gStake          :: !Integer
     , gPlayDeadline   :: !POSIXTime
     , gRevealDeadline :: !POSIXTime
@@ -59,7 +59,7 @@ instance Eq GameChoice where
 
 PlutusTx.unstableMakeIsData ''GameChoice
 
-data GameDatum = GameDatum ByteString (Maybe GameChoice)
+data GameDatum = GameDatum BuiltinByteString (Maybe GameChoice)
     deriving Show
 
 instance Eq GameDatum where
@@ -68,7 +68,7 @@ instance Eq GameDatum where
 
 PlutusTx.unstableMakeIsData ''GameDatum
 
-data GameRedeemer = Play GameChoice | Reveal ByteString | ClaimFirst | ClaimSecond
+data GameRedeemer = Play GameChoice | Reveal BuiltinByteString | ClaimFirst | ClaimSecond
     deriving Show
 
 PlutusTx.unstableMakeIsData ''GameRedeemer
@@ -78,19 +78,18 @@ lovelaces :: Value -> Integer
 lovelaces = Ada.getLovelace . Ada.fromValue
 
 {-# INLINABLE gameDatum #-}
-gameDatum :: TxOut -> (DatumHash -> Maybe Datum) -> Maybe GameDatum
-gameDatum o f = do
-    dh      <- txOutDatum o
-    Datum d <- f dh
+gameDatum :: Maybe Datum -> Maybe GameDatum
+gameDatum md = do
+    Datum d <- md
     PlutusTx.fromBuiltinData d
 
 {-# INLINABLE mkGameValidator #-}
-mkGameValidator :: Game -> ByteString -> ByteString -> GameDatum -> GameRedeemer -> ScriptContext -> Bool
+mkGameValidator :: Game -> BuiltinByteString -> BuiltinByteString -> GameDatum -> GameRedeemer -> ScriptContext -> Bool
 mkGameValidator game bsZero' bsOne' dat red ctx =
     traceIfFalse "token missing from input" (assetClassValueOf (txOutValue ownInput) (gToken game) == 1) &&
     case (dat, red) of
         (GameDatum bs Nothing, Play c) ->
-            traceIfFalse "not signed by second player"   (txSignedBy info (gSecond game))                                   &&
+            traceIfFalse "not signed by second player"   (txSignedBy info (unPaymentPubKeyHash $ gSecond game))             &&
             traceIfFalse "first player's stake missing"  (lovelaces (txOutValue ownInput) == gStake game)                   &&
             traceIfFalse "second player's stake missing" (lovelaces (txOutValue ownOutput) == (2 * gStake game))            &&
             traceIfFalse "wrong output datum"            (outputDatum == GameDatum bs (Just c))                             &&
@@ -98,25 +97,25 @@ mkGameValidator game bsZero' bsOne' dat red ctx =
             traceIfFalse "token missing from output"     (assetClassValueOf (txOutValue ownOutput) (gToken game) == 1)
 
         (GameDatum bs (Just c), Reveal nonce) ->
-            traceIfFalse "not signed by first player"    (txSignedBy info (gFirst game))                                    &&
+            traceIfFalse "not signed by first player"    (txSignedBy info (unPaymentPubKeyHash $ gFirst game))              &&
             traceIfFalse "commit mismatch"               (checkNonce bs nonce c)                                            &&
             traceIfFalse "missed deadline"               (to (gRevealDeadline game) `contains` txInfoValidRange info)       &&
             traceIfFalse "wrong stake"                   (lovelaces (txOutValue ownInput) == (2 * gStake game))             &&
             traceIfFalse "NFT must go to first player"   nftToFirst
 
         (GameDatum _ Nothing, ClaimFirst) ->
-            traceIfFalse "not signed by first player"    (txSignedBy info (gFirst game))                                    &&
+            traceIfFalse "not signed by first player"    (txSignedBy info (unPaymentPubKeyHash $ gFirst game))              &&
             traceIfFalse "too early"                     (from (1 + gPlayDeadline game) `contains` txInfoValidRange info)   &&
             traceIfFalse "first player's stake missing"  (lovelaces (txOutValue ownInput) == gStake game)                   &&
             traceIfFalse "NFT must go to first player"   nftToFirst
 
         (GameDatum _ (Just _), ClaimSecond) ->
-            traceIfFalse "not signed by second player"   (txSignedBy info (gSecond game))                                   &&
+            traceIfFalse "not signed by second player"   (txSignedBy info (unPaymentPubKeyHash $ gSecond game))             &&
             traceIfFalse "too early"                     (from (1 + gRevealDeadline game) `contains` txInfoValidRange info) &&
             traceIfFalse "wrong stake"                   (lovelaces (txOutValue ownInput) == (2 * gStake game))             &&
             traceIfFalse "NFT must go to first player"   nftToFirst
 
-        _                              -> False
+        _ -> False
   where
     info :: TxInfo
     info = scriptContextTxInfo ctx
@@ -132,27 +131,27 @@ mkGameValidator game bsZero' bsOne' dat red ctx =
         _   -> traceError "expected exactly one game output"
 
     outputDatum :: GameDatum
-    outputDatum = case gameDatum ownOutput (`findDatum` info) of
+    outputDatum = case gameDatum $ txOutDatumHash ownOutput >>= flip findDatum info of
         Nothing -> traceError "game output datum not found"
         Just d  -> d
 
-    checkNonce :: ByteString -> ByteString -> GameChoice -> Bool
-    checkNonce bs nonce cSecond = sha2_256 (nonce `concatenate` cFirst) == bs
+    checkNonce :: BuiltinByteString -> BuiltinByteString -> GameChoice -> Bool
+    checkNonce bs nonce cSecond = sha2_256 (nonce `appendByteString` cFirst) == bs
       where
-        cFirst :: ByteString
+        cFirst :: BuiltinByteString
         cFirst = case cSecond of
             Zero -> bsZero'
             One  -> bsOne'
 
     nftToFirst :: Bool
-    nftToFirst = assetClassValueOf (valuePaidTo info $ gFirst game) (gToken game) == 1
+    nftToFirst = assetClassValueOf (valuePaidTo info $ unPaymentPubKeyHash $ gFirst game) (gToken game) == 1
 
 data Gaming
 instance Scripts.ValidatorTypes Gaming where
     type instance DatumType Gaming = GameDatum
     type instance RedeemerType Gaming = GameRedeemer
 
-bsZero, bsOne :: ByteString
+bsZero, bsOne :: BuiltinByteString
 bsZero = "0"
 bsOne  = "1"
 
@@ -172,16 +171,16 @@ gameValidator = Scripts.validatorScript . typedGameValidator
 gameAddress :: Game -> Ledger.Address
 gameAddress = scriptAddress . gameValidator
 
-findGameOutput :: Game -> Contract w s Text (Maybe (TxOutRef, TxOutTx, GameDatum))
+findGameOutput :: Game -> Contract w s Text (Maybe (TxOutRef, ChainIndexTxOut, GameDatum))
 findGameOutput game = do
-    utxos <- utxoAt $ gameAddress game
+    utxos <- utxosAt $ gameAddress game
     return $ do
         (oref, o) <- find f $ Map.toList utxos
-        dat       <- gameDatum (txOutTxOut o) (`Map.lookup` txData (txOutTxTx o))
+        dat       <- gameDatum $ either (const Nothing) Just $ _ciTxOutDatum o
         return (oref, o, dat)
   where
-    f :: (TxOutRef, TxOutTx) -> Bool
-    f (_, o) = assetClassValueOf (txOutValue $ txOutTxOut o) (gToken game) == 1
+    f :: (TxOutRef, ChainIndexTxOut) -> Bool
+    f (_, o) = assetClassValueOf (_ciTxOutValue o) (gToken game) == 1
 
 waitUntilTimeHasPassed :: AsContractError e => POSIXTime -> Contract w s e ()
 waitUntilTimeHasPassed t = do
@@ -192,11 +191,11 @@ waitUntilTimeHasPassed t = do
     logInfo @String $ "waited until: " ++ show s2
 
 data FirstParams = FirstParams
-    { fpSecond         :: !PubKeyHash
+    { fpSecond         :: !PaymentPubKeyHash
     , fpStake          :: !Integer
     , fpPlayDeadline   :: !POSIXTime
     , fpRevealDeadline :: !POSIXTime
-    , fpNonce          :: !ByteString
+    , fpNonce          :: !BuiltinByteString
     , fpCurrency       :: !CurrencySymbol
     , fpTokenName      :: !TokenName
     , fpChoice         :: !GameChoice
@@ -204,7 +203,7 @@ data FirstParams = FirstParams
 
 firstGame :: forall w s. FirstParams -> Contract w s Text ()
 firstGame fp = do
-    pkh <- pubKeyHash <$> Contract.ownPubKey
+    pkh <- Contract.ownPaymentPubKeyHash
     let game = Game
             { gFirst          = pkh
             , gSecond         = fpSecond fp
@@ -215,10 +214,10 @@ firstGame fp = do
             }
         v    = lovelaceValueOf (fpStake fp) <> assetClassValue (gToken game) 1
         c    = fpChoice fp
-        bs   = sha2_256 $ fpNonce fp `concatenate` if c == Zero then bsZero else bsOne
+        bs   = sha2_256 $ fpNonce fp `appendByteString` if c == Zero then bsZero else bsOne
         tx   = Constraints.mustPayToTheScript (GameDatum bs Nothing) v
     ledgerTx <- submitTxConstraints (typedGameValidator game) tx
-    void $ awaitTxConfirmed $ txId ledgerTx
+    void $ awaitTxConfirmed $ getCardanoTxId ledgerTx
     logInfo @String $ "made first move: " ++ show (fpChoice fp)
 
     waitUntilTimeHasPassed $ fpPlayDeadline fp
@@ -235,7 +234,7 @@ firstGame fp = do
                     tx'     = Constraints.mustSpendScriptOutput oref (Redeemer $ PlutusTx.toBuiltinData ClaimFirst) <>
                               Constraints.mustValidateIn (from now)
                 ledgerTx' <- submitTxConstraintsWith @Gaming lookups tx'
-                void $ awaitTxConfirmed $ txId ledgerTx'
+                void $ awaitTxConfirmed $ getCardanoTxId ledgerTx'
                 logInfo @String "reclaimed stake"
 
             GameDatum _ (Just c') | c' == c -> do
@@ -246,13 +245,13 @@ firstGame fp = do
                     tx'     = Constraints.mustSpendScriptOutput oref (Redeemer $ PlutusTx.toBuiltinData $ Reveal $ fpNonce fp) <>
                               Constraints.mustValidateIn (to $ now + 1000)
                 ledgerTx' <- submitTxConstraintsWith @Gaming lookups tx'
-                void $ awaitTxConfirmed $ txId ledgerTx'
+                void $ awaitTxConfirmed $ getCardanoTxId ledgerTx'
                 logInfo @String "victory"
 
             _ -> logInfo @String "second player played and won"
 
 data SecondParams = SecondParams
-    { spFirst          :: !PubKeyHash
+    { spFirst          :: !PaymentPubKeyHash
     , spStake          :: !Integer
     , spPlayDeadline   :: !POSIXTime
     , spRevealDeadline :: !POSIXTime
@@ -263,7 +262,7 @@ data SecondParams = SecondParams
 
 secondGame :: forall w s. SecondParams -> Contract w s Text ()
 secondGame sp = do
-    pkh <- pubKeyHash <$> Contract.ownPubKey
+    pkh <- Contract.ownPaymentPubKeyHash
     let game = Game
             { gFirst          = spFirst sp
             , gSecond         = pkh
@@ -287,7 +286,7 @@ secondGame sp = do
                           Constraints.mustPayToTheScript (GameDatum bs $ Just c) v                            <>
                           Constraints.mustValidateIn (to now)
             ledgerTx <- submitTxConstraintsWith @Gaming lookups tx
-            let tid = txId ledgerTx
+            let tid = getCardanoTxId ledgerTx
             void $ awaitTxConfirmed tid
             logInfo @String $ "made second move: " ++ show (spChoice sp)
 
@@ -303,9 +302,9 @@ secondGame sp = do
                                    Constraints.otherScript (gameValidator game)
                         tx'      = Constraints.mustSpendScriptOutput oref' (Redeemer $ PlutusTx.toBuiltinData ClaimSecond) <>
                                    Constraints.mustValidateIn (from now')                                                  <>
-                                   Constraints.mustPayToPubKey (spFirst sp) token
+                                   Constraints.mustPayToPubKey (spFirst sp) (token <> adaValueOf (getAda minAdaTxOut))
                     ledgerTx' <- submitTxConstraintsWith @Gaming lookups' tx'
-                    void $ awaitTxConfirmed $ txId ledgerTx'
+                    void $ awaitTxConfirmed $ getCardanoTxId ledgerTx'
                     logInfo @String "second player won"
 
         _ -> logInfo @String "no running game found"
@@ -313,7 +312,7 @@ secondGame sp = do
 type GameSchema = Endpoint "first" FirstParams .\/ Endpoint "second" SecondParams
 
 endpoints :: Contract () GameSchema Text ()
-endpoints = (first `select` second) >> endpoints
+endpoints = awaitPromise (first `select` second) >> endpoints
   where
-    first  = endpoint @"first"  >>= firstGame
-    second = endpoint @"second" >>= secondGame
+    first  = endpoint @"first"  firstGame
+    second = endpoint @"second" secondGame

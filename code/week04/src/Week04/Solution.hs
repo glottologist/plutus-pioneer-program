@@ -1,9 +1,10 @@
-{-# LANGUAGE DataKinds         #-}
-{-# LANGUAGE DeriveAnyClass    #-}
-{-# LANGUAGE DeriveGeneric     #-}
-{-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE TypeApplications  #-}
-{-# LANGUAGE TypeOperators     #-}
+{-# LANGUAGE DataKinds          #-}
+{-# LANGUAGE DeriveAnyClass     #-}
+{-# LANGUAGE DeriveGeneric      #-}
+{-# LANGUAGE NumericUnderscores #-}
+{-# LANGUAGE OverloadedStrings  #-}
+{-# LANGUAGE TypeApplications   #-}
+{-# LANGUAGE TypeOperators      #-}
 
 module Week04.Solution where
 
@@ -19,7 +20,7 @@ import Plutus.Trace.Emulator  as Emulator
 import Wallet.Emulator.Wallet
 
 data PayParams = PayParams
-    { ppRecipient :: PubKeyHash
+    { ppRecipient :: PaymentPubKeyHash
     , ppLovelace  :: Integer
     } deriving (Show, Generic, FromJSON, ToJSON)
 
@@ -27,15 +28,15 @@ type PaySchema = Endpoint "pay" PayParams
 
 payContract :: Contract () PaySchema Text ()
 payContract = do
-    pp <- endpoint @"pay"
+    pp <- awaitPromise $ endpoint @"pay" return
     let tx = mustPayToPubKey (ppRecipient pp) $ lovelaceValueOf $ ppLovelace pp
     handleError (\err -> Contract.logInfo $ "caught error: " ++ unpack err) $ void $ submitTx tx
     payContract
 
 payTrace :: Integer -> Integer -> EmulatorTrace ()
 payTrace x y = do
-    h <- activateContractWallet (Wallet 1) payContract
-    let pkh = pubKeyHash $ walletPubKey $ Wallet 2
+    h <- activateContractWallet (knownWallet 1) payContract
+    let pkh = mockWalletPaymentPubKeyHash $ knownWallet 2
     callEndpoint @"pay" h $ PayParams
         { ppRecipient = pkh
         , ppLovelace  = x
@@ -48,7 +49,7 @@ payTrace x y = do
     void $ Emulator.waitNSlots 1
 
 payTest1 :: IO ()
-payTest1 = runEmulatorTraceIO $ payTrace 1000000 2000000
+payTest1 = runEmulatorTraceIO $ payTrace 10_000_000 20_000_000
 
 payTest2 :: IO ()
-payTest2 = runEmulatorTraceIO $ payTrace 1000000000 2000000
+payTest2 = runEmulatorTraceIO $ payTrace 1000_000_000 20_000_000

@@ -55,13 +55,13 @@ mint mp = do
         lookups = Constraints.mintingPolicy policy
         tx      = Constraints.mustMintValue val
     ledgerTx <- submitTxConstraintsWith @Void lookups tx
-    void $ awaitTxConfirmed $ txId ledgerTx
+    void $ awaitTxConfirmed $ getCardanoTxId ledgerTx
     Contract.logInfo @String $ printf "forged %s" (show val)
 
 endpoints :: Contract () FreeSchema Text ()
 endpoints = mint' >> endpoints
   where
-    mint' = endpoint @"mint" >>= mint
+    mint' = awaitPromise $ endpoint @"mint" mint
 
 mkSchemaDefinitions ''FreeSchema
 
@@ -70,8 +70,8 @@ mkKnownCurrencies []
 test :: IO ()
 test = runEmulatorTraceIO $ do
     let tn = "ABC"
-    h1 <- activateContractWallet (Wallet 1) endpoints
-    h2 <- activateContractWallet (Wallet 2) endpoints
+    h1 <- activateContractWallet (knownWallet 1) endpoints
+    h2 <- activateContractWallet (knownWallet 2) endpoints
     callEndpoint @"mint" h1 $ MintParams
         { mpTokenName = tn
         , mpAmount    = 555

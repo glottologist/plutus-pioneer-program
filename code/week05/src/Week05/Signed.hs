@@ -33,16 +33,16 @@ import           Text.Printf            (printf)
 import           Wallet.Emulator.Wallet
 
 {-# INLINABLE mkPolicy #-}
-mkPolicy :: PubKeyHash -> () -> ScriptContext -> Bool
-mkPolicy pkh () ctx = txSignedBy (scriptContextTxInfo ctx) pkh
+mkPolicy :: PaymentPubKeyHash -> () -> ScriptContext -> Bool
+mkPolicy pkh () ctx = txSignedBy (scriptContextTxInfo ctx) $ unPaymentPubKeyHash pkh
 
-policy :: PubKeyHash -> Scripts.MintingPolicy
+policy :: PaymentPubKeyHash -> Scripts.MintingPolicy
 policy pkh = mkMintingPolicyScript $
     $$(PlutusTx.compile [|| Scripts.wrapMintingPolicy . mkPolicy ||])
     `PlutusTx.applyCode`
-    (PlutusTx.liftCode pkh)
+    PlutusTx.liftCode pkh
 
-curSymbol :: PubKeyHash -> CurrencySymbol
+curSymbol :: PaymentPubKeyHash -> CurrencySymbol
 curSymbol = scriptCurrencySymbol . policy
 
 data MintParams = MintParams
@@ -50,32 +50,32 @@ data MintParams = MintParams
     , mpAmount    :: !Integer
     } deriving (Generic, ToJSON, FromJSON, ToSchema)
 
-type SignedSchema = Endpoint "mint" MintParams
+type FreeSchema = Endpoint "mint" MintParams
 
-mint :: MintParams -> Contract w SignedSchema Text ()
+mint :: MintParams -> Contract w FreeSchema Text ()
 mint mp = do
-    pkh <- pubKeyHash <$> Contract.ownPubKey
+    pkh <- Contract.ownPaymentPubKeyHash
     let val     = Value.singleton (curSymbol pkh) (mpTokenName mp) (mpAmount mp)
         lookups = Constraints.mintingPolicy $ policy pkh
         tx      = Constraints.mustMintValue val
     ledgerTx <- submitTxConstraintsWith @Void lookups tx
-    void $ awaitTxConfirmed $ txId ledgerTx
+    void $ awaitTxConfirmed $ getCardanoTxId ledgerTx
     Contract.logInfo @String $ printf "forged %s" (show val)
 
-endpoints :: Contract () SignedSchema Text ()
+endpoints :: Contract () FreeSchema Text ()
 endpoints = mint' >> endpoints
   where
-    mint' = endpoint @"mint" >>= mint
+    mint' = awaitPromise $ endpoint @"mint" mint
 
-mkSchemaDefinitions ''SignedSchema
+mkSchemaDefinitions ''FreeSchema
 
 mkKnownCurrencies []
 
 test :: IO ()
 test = runEmulatorTraceIO $ do
     let tn = "ABC"
-    h1 <- activateContractWallet (Wallet 1) endpoints
-    h2 <- activateContractWallet (Wallet 2) endpoints
+    h1 <- activateContractWallet (knownWallet 1) endpoints
+    h2 <- activateContractWallet (knownWallet 2) endpoints
     callEndpoint @"mint" h1 $ MintParams
         { mpTokenName = tn
         , mpAmount    = 555

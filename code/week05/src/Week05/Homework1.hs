@@ -36,15 +36,15 @@ import           Text.Printf                (printf)
 import           Wallet.Emulator.Wallet
 
 {-# INLINABLE mkPolicy #-}
--- This policy should only allow minting (or burning) of tokens if the owner of the specified PubKeyHash
+-- This policy should only allow minting (or burning) of tokens if the owner of the specified PaymentPubKeyHash
 -- has signed the transaction and if the specified deadline has not passed.
-mkPolicy :: PubKeyHash -> POSIXTime -> () -> ScriptContext -> Bool
+mkPolicy :: PaymentPubKeyHash -> POSIXTime -> () -> ScriptContext -> Bool
 mkPolicy pkh deadline () ctx = True -- FIX ME!
 
-policy :: PubKeyHash -> POSIXTime -> Scripts.MintingPolicy
+policy :: PaymentPubKeyHash -> POSIXTime -> Scripts.MintingPolicy
 policy pkh deadline = undefined -- IMPLEMENT ME!
 
-curSymbol :: PubKeyHash -> POSIXTime -> CurrencySymbol
+curSymbol :: PaymentPubKeyHash -> POSIXTime -> CurrencySymbol
 curSymbol pkh deadline = undefined -- IMPLEMENT ME!
 
 data MintParams = MintParams
@@ -57,7 +57,7 @@ type SignedSchema = Endpoint "mint" MintParams
 
 mint :: MintParams -> Contract w SignedSchema Text ()
 mint mp = do
-    pkh <- pubKeyHash <$> Contract.ownPubKey
+    pkh <- Contract.ownPaymentPubKeyHash
     now <- Contract.currentTime
     let deadline = mpDeadline mp
     if now > deadline
@@ -65,15 +65,15 @@ mint mp = do
         else do
             let val     = Value.singleton (curSymbol pkh deadline) (mpTokenName mp) (mpAmount mp)
                 lookups = Constraints.mintingPolicy $ policy pkh deadline
-                tx      = Constraints.mustMintValue val <> Constraints.mustValidateIn (to $ now + 5000)
+                tx      = Constraints.mustMintValue val <> Constraints.mustValidateIn (to $ now + 60000)
             ledgerTx <- submitTxConstraintsWith @Void lookups tx
-            void $ awaitTxConfirmed $ txId ledgerTx
+            void $ awaitTxConfirmed $ getCardanoTxId ledgerTx
             Contract.logInfo @String $ printf "forged %s" (show val)
 
 endpoints :: Contract () SignedSchema Text ()
 endpoints = mint' >> endpoints
   where
-    mint' = endpoint @"mint" >>= mint
+    mint' = awaitPromise $ endpoint @"mint" mint
 
 mkSchemaDefinitions ''SignedSchema
 
@@ -82,14 +82,14 @@ mkKnownCurrencies []
 test :: IO ()
 test = runEmulatorTraceIO $ do
     let tn       = "ABC"
-        deadline = slotToBeginPOSIXTime def 10
-    h <- activateContractWallet (Wallet 1) endpoints
+        deadline = slotToBeginPOSIXTime def 100
+    h <- activateContractWallet (knownWallet 1) endpoints
     callEndpoint @"mint" h $ MintParams
         { mpTokenName = tn
         , mpDeadline  = deadline
         , mpAmount    = 555
         }
-    void $ Emulator.waitNSlots 15
+    void $ Emulator.waitNSlots 110
     callEndpoint @"mint" h $ MintParams
         { mpTokenName = tn
         , mpDeadline  = deadline

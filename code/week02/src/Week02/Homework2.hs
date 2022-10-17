@@ -69,26 +69,26 @@ give :: AsContractError e => Integer -> Contract w s e ()
 give amount = do
     let tx = mustPayToTheScript () $ Ada.lovelaceValueOf amount
     ledgerTx <- submitTxConstraints typedValidator tx
-    void $ awaitTxConfirmed $ txId ledgerTx
+    void $ awaitTxConfirmed $ getCardanoTxId ledgerTx
     logInfo @String $ printf "made a gift of %d lovelace" amount
 
 grab :: forall w s e. AsContractError e => MyRedeemer -> Contract w s e ()
 grab r = do
-    utxos <- utxoAt scrAddress
+    utxos <- utxosAt scrAddress
     let orefs   = fst <$> Map.toList utxos
         lookups = Constraints.unspentOutputs utxos      <>
                   Constraints.otherScript validator
         tx :: TxConstraints Void Void
-        tx      = mconcat [mustSpendScriptOutput oref $ Redeemer $ PlutusTx.toData r | oref <- orefs]
+        tx      = mconcat [mustSpendScriptOutput oref $ Redeemer $ PlutusTx.toBuiltinData r | oref <- orefs]
     ledgerTx <- submitTxConstraintsWith @Void lookups tx
-    void $ awaitTxConfirmed $ txId ledgerTx
+    void $ awaitTxConfirmed $ getCardanoTxId ledgerTx
     logInfo @String $ "collected gifts"
 
 endpoints :: Contract () GiftSchema Text ()
-endpoints = (give' `select` grab') >> endpoints
+endpoints = awaitPromise (give' `select` grab') >> endpoints
   where
-    give' = endpoint @"give" >>= give
-    grab' = endpoint @"grab" >>= grab
+    give' = endpoint @"give" give
+    grab' = endpoint @"grab" grab
 
 mkSchemaDefinitions ''GiftSchema
 

@@ -18,6 +18,7 @@ module Week08.TokenSaleWithClose
     , TSUseSchema
     , startEndpoint
     , useEndpoints
+    , useEndpoints'
     ) where
 
 import           Control.Monad                hiding (fmap)
@@ -34,13 +35,13 @@ import           Ledger.Ada                   as Ada
 import           Ledger.Constraints           as Constraints
 import qualified Ledger.Typed.Scripts         as Scripts
 import           Ledger.Value
-import           Prelude                      (Semigroup (..), Show (..), uncurry)
+import           Prelude                      (Semigroup (..), Show (..))
 import qualified Prelude
 
 data TokenSale = TokenSale
-    { tsSeller :: !PubKeyHash
+    { tsSeller :: !PaymentPubKeyHash
     , tsToken  :: !AssetClass
-    , tsTT     :: !(Maybe ThreadToken)
+    , tsTT     :: !ThreadToken
     } deriving (Show, Generic, FromJSON, ToJSON, Prelude.Eq)
 
 PlutusTx.makeLift ''TokenSale
@@ -62,34 +63,37 @@ lovelaces = Ada.getLovelace . Ada.fromValue
 {-# INLINABLE transition #-}
 transition :: TokenSale -> State (Maybe Integer) -> TSRedeemer -> Maybe (TxConstraints Void Void, State (Maybe Integer))
 transition ts s r = case (stateValue s, stateData s, r) of
-    (v, Just _, SetPrice p)   | p >= 0           -> Just ( Constraints.mustBeSignedBy (tsSeller ts)
-                                                         , State (Just p) v
-                                                         )
-    (v, Just p, AddTokens n)  | n > 0            -> Just ( mempty
-                                                         , State (Just p) $
-                                                           v                                       <>
-                                                           assetClassValue (tsToken ts) n
-                                                         )
-    (v, Just p, BuyTokens n)  | n > 0            -> Just ( mempty
-                                                         , State (Just p) $
-                                                           v                                       <>
-                                                           assetClassValue (tsToken ts) (negate n) <>
-                                                           lovelaceValueOf (n * p)
-                                                         )
-    (v, Just p, Withdraw n l) | n >= 0 && l >= 0 -> Just ( Constraints.mustBeSignedBy (tsSeller ts)
-                                                         , State (Just p) $
-                                                           v                                       <>
-                                                           assetClassValue (tsToken ts) (negate n) <>
-                                                           lovelaceValueOf (negate l)
-                                                         )
-    (_, Just _, Close)                           -> Just ( Constraints.mustBeSignedBy (tsSeller ts)
-                                                         , State Nothing mempty
-                                                         )
-    _                                            -> Nothing
+    (v, Just _, SetPrice p)   | p >= 0                             -> Just ( Constraints.mustBeSignedBy (tsSeller ts)
+                                                                           , State (Just p) v
+                                                                           )
+    (v, Just p, AddTokens n)  | n > 0                              -> Just ( mempty
+                                                                           , State (Just p) $
+                                                                             v                                       <>
+                                                                             assetClassValue (tsToken ts) n
+                                                                           )
+    (v, Just p, BuyTokens n)  | n > 0                              -> Just ( mempty
+                                                                           , State (Just p) $
+                                                                             v                                       <>
+                                                                             assetClassValue (tsToken ts) (negate n) <>
+                                                                             lovelaceValueOf (n * p)
+                                                                           )
+    (v, Just p, Withdraw n l) | n >= 0 && l >= 0 &&
+                                v `geq` (w <> toValue minAdaTxOut) -> Just ( Constraints.mustBeSignedBy (tsSeller ts)
+                                                                           , State (Just p) $
+                                                                             v                                       <>
+                                                                             negate w
+                                                                           )
+      where
+        w = assetClassValue (tsToken ts) n <>
+            lovelaceValueOf l
+    (_, Just _, Close)                                             -> Just ( Constraints.mustBeSignedBy (tsSeller ts)
+                                                                           , State Nothing mempty
+                                                                           )
+    _                                                              -> Nothing
 
 {-# INLINABLE tsStateMachine #-}
 tsStateMachine :: TokenSale -> StateMachine (Maybe Integer) TSRedeemer
-tsStateMachine ts = mkStateMachine (tsTT ts) (transition ts) isNothing
+tsStateMachine ts = mkStateMachine (Just $ tsTT ts) (transition ts) isNothing
 
 {-# INLINABLE mkTSValidator #-}
 mkTSValidator :: TokenSale -> Maybe Integer -> TSRedeemer -> ScriptContext -> Bool
@@ -116,10 +120,10 @@ tsClient ts = mkStateMachineClient $ StateMachineInstance (tsStateMachine ts) (t
 mapErrorSM :: Contract w s SMContractError a -> Contract w s Text a
 mapErrorSM = mapError $ pack . show
 
-startTS :: AssetClass -> Bool -> Contract (Last TokenSale) s Text ()
-startTS token useTT = do
-    pkh <- pubKeyHash <$> Contract.ownPubKey
-    tt  <- if useTT then Just <$> mapErrorSM getThreadToken else return Nothing
+startTS :: AssetClass -> Contract (Last TokenSale) s Text ()
+startTS token = do
+    pkh <- Contract.ownPaymentPubKeyHash
+    tt  <- mapErrorSM getThreadToken
     let ts = TokenSale
             { tsSeller = pkh
             , tsToken  = token
@@ -146,7 +150,7 @@ close :: TokenSale -> Contract w s Text ()
 close ts = void $ mapErrorSM $ runStep (tsClient ts) Close
 
 type TSStartSchema =
-        Endpoint "start"      (CurrencySymbol, TokenName, Bool)
+        Endpoint "start"      (CurrencySymbol, TokenName)
 type TSUseSchema =
         Endpoint "set price"  Integer
     .\/ Endpoint "add tokens" Integer
@@ -158,13 +162,23 @@ startEndpoint :: Contract (Last TokenSale) TSStartSchema Text ()
 startEndpoint = forever
               $ handleError logError
               $ awaitPromise
-              $ endpoint @"start" $ \(cs, tn, useTT) -> startTS (AssetClass (cs, tn)) useTT
+              $ endpoint @"start" $ startTS . AssetClass
+
+useEndpoints' :: ( HasEndpoint "set price" Integer s
+                 , HasEndpoint "add tokens" Integer s
+                 , HasEndpoint "buy tokens" Integer s
+                 , HasEndpoint "withdraw" (Integer, Integer) s
+                 , HasEndpoint "close" () s
+                 )
+              => TokenSale
+              -> Promise () s Text ()
+useEndpoints' ts = setPrice' `select` addTokens' `select` buyTokens' `select` withdraw' `select` close'
+  where
+    setPrice'  = endpoint @"set price"  $ \p      -> handleError logError (setPrice ts p)
+    addTokens' = endpoint @"add tokens" $ \n      -> handleError logError (addTokens ts n)
+    buyTokens' = endpoint @"buy tokens" $ \n      -> handleError logError (buyTokens ts n)
+    withdraw'  = endpoint @"withdraw"   $ \(n, l) -> handleError logError (withdraw ts n l)
+    close'     = endpoint @"close"      $ \()     -> handleError logError (close ts)
 
 useEndpoints :: TokenSale -> Contract () TSUseSchema Text ()
-useEndpoints ts = forever $ handleError logError $ awaitPromise $ setPrice' `select` addTokens' `select` buyTokens' `select` withdraw' `select` close'
-  where
-    setPrice'  = endpoint @"set price"  $ setPrice ts
-    addTokens' = endpoint @"add tokens" $ addTokens ts
-    buyTokens' = endpoint @"buy tokens" $ buyTokens ts
-    withdraw'  = endpoint @"withdraw"   $ uncurry (withdraw ts)
-    close'     = endpoint @"close"      $ const $ close ts
+useEndpoints = forever . awaitPromise . useEndpoints'

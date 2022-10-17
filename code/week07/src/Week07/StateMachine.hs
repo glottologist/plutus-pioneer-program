@@ -42,8 +42,8 @@ import           Prelude                      (Semigroup (..), Show (..), String
 import qualified Prelude
 
 data Game = Game
-    { gFirst          :: !PubKeyHash
-    , gSecond         :: !PubKeyHash
+    { gFirst          :: !PaymentPubKeyHash
+    , gSecond         :: !PaymentPubKeyHash
     , gStake          :: !Integer
     , gPlayDeadline   :: !POSIXTime
     , gRevealDeadline :: !POSIXTime
@@ -63,7 +63,7 @@ instance Eq GameChoice where
 
 PlutusTx.unstableMakeIsData ''GameChoice
 
-data GameDatum = GameDatum ByteString (Maybe GameChoice) | Finished
+data GameDatum = GameDatum BuiltinByteString (Maybe GameChoice) | Finished
     deriving Show
 
 instance Eq GameDatum where
@@ -74,7 +74,7 @@ instance Eq GameDatum where
 
 PlutusTx.unstableMakeIsData ''GameDatum
 
-data GameRedeemer = Play GameChoice | Reveal ByteString | ClaimFirst | ClaimSecond
+data GameRedeemer = Play GameChoice | Reveal BuiltinByteString | ClaimFirst | ClaimSecond
     deriving Show
 
 PlutusTx.unstableMakeIsData ''GameRedeemer
@@ -121,13 +121,13 @@ final Finished = True
 final _        = False
 
 {-# INLINABLE check #-}
-check :: ByteString -> ByteString -> GameDatum -> GameRedeemer -> ScriptContext -> Bool
+check :: BuiltinByteString -> BuiltinByteString -> GameDatum -> GameRedeemer -> ScriptContext -> Bool
 check bsZero' bsOne' (GameDatum bs (Just c)) (Reveal nonce) _ =
-    sha2_256 (nonce `concatenate` if c == Zero then bsZero' else bsOne') == bs
+    sha2_256 (nonce `appendByteString` if c == Zero then bsZero' else bsOne') == bs
 check _       _      _                       _              _ = True
 
 {-# INLINABLE gameStateMachine #-}
-gameStateMachine :: Game -> ByteString -> ByteString -> StateMachine GameDatum GameRedeemer
+gameStateMachine :: Game -> BuiltinByteString -> BuiltinByteString -> StateMachine GameDatum GameRedeemer
 gameStateMachine game bsZero' bsOne' = StateMachine
     { smTransition  = transition game
     , smFinal       = final
@@ -136,12 +136,12 @@ gameStateMachine game bsZero' bsOne' = StateMachine
     }
 
 {-# INLINABLE mkGameValidator #-}
-mkGameValidator :: Game -> ByteString -> ByteString -> GameDatum -> GameRedeemer -> ScriptContext -> Bool
+mkGameValidator :: Game -> BuiltinByteString -> BuiltinByteString -> GameDatum -> GameRedeemer -> ScriptContext -> Bool
 mkGameValidator game bsZero' bsOne' = mkValidator $ gameStateMachine game bsZero' bsOne'
 
 type Gaming = StateMachine GameDatum GameRedeemer
 
-bsZero, bsOne :: ByteString
+bsZero, bsOne :: BuiltinByteString
 bsZero = "0"
 bsOne  = "1"
 
@@ -168,11 +168,11 @@ gameClient :: Game -> StateMachineClient GameDatum GameRedeemer
 gameClient game = mkStateMachineClient $ StateMachineInstance (gameStateMachine' game) (typedGameValidator game)
 
 data FirstParams = FirstParams
-    { fpSecond         :: !PubKeyHash
+    { fpSecond         :: !PaymentPubKeyHash
     , fpStake          :: !Integer
     , fpPlayDeadline   :: !POSIXTime
     , fpRevealDeadline :: !POSIXTime
-    , fpNonce          :: !ByteString
+    , fpNonce          :: !BuiltinByteString
     , fpChoice         :: !GameChoice
     } deriving (Show, Generic, FromJSON, ToJSON, ToSchema)
 
@@ -184,7 +184,7 @@ waitUntilTimeHasPassed t = void $ awaitTime t >> waitNSlots 1
 
 firstGame :: forall s. FirstParams -> Contract (Last ThreadToken) s Text ()
 firstGame fp = do
-    pkh <- pubKeyHash <$> Contract.ownPubKey
+    pkh <- Contract.ownPaymentPubKeyHash
     tt  <- mapError' getThreadToken
     let game   = Game
             { gFirst          = pkh
@@ -197,7 +197,7 @@ firstGame fp = do
         client = gameClient game
         v      = lovelaceValueOf (fpStake fp)
         c      = fpChoice fp
-        bs     = sha2_256 $ fpNonce fp `concatenate` if c == Zero then bsZero else bsOne
+        bs     = sha2_256 $ fpNonce fp `appendByteString` if c == Zero then bsZero else bsOne
     void $ mapError' $ runInitialise client (GameDatum bs Nothing) v
     logInfo @String $ "made first move: " ++ show (fpChoice fp)
     tell $ Last $ Just tt
@@ -206,8 +206,8 @@ firstGame fp = do
 
     m <- mapError' $ getOnChainState client
     case m of
-        Nothing             -> throwError "game output not found"
-        Just ((o, _), _) -> case tyTxOutData o of
+        Nothing     -> throwError "game output not found"
+        Just (o, _) -> case tyTxOutData $ ocsTxOut o of
 
             GameDatum _ Nothing -> do
                 logInfo @String "second player did not play"
@@ -222,7 +222,7 @@ firstGame fp = do
             _ -> logInfo @String "second player played and won"
 
 data SecondParams = SecondParams
-    { spFirst          :: !PubKeyHash
+    { spFirst          :: !PaymentPubKeyHash
     , spStake          :: !Integer
     , spPlayDeadline   :: !POSIXTime
     , spRevealDeadline :: !POSIXTime
@@ -232,7 +232,7 @@ data SecondParams = SecondParams
 
 secondGame :: forall w s. SecondParams -> Contract w s Text ()
 secondGame sp = do
-    pkh <- pubKeyHash <$> Contract.ownPubKey
+    pkh <- Contract.ownPaymentPubKeyHash
     let game   = Game
             { gFirst          = spFirst sp
             , gSecond         = pkh
@@ -245,7 +245,7 @@ secondGame sp = do
     m <- mapError' $ getOnChainState client
     case m of
         Nothing          -> logInfo @String "no running game found"
-        Just ((o, _), _) -> case tyTxOutData o of
+        Just (o, _) -> case tyTxOutData $ ocsTxOut o of
             GameDatum _ Nothing -> do
                 logInfo @String "running game found"
                 void $ mapError' $ runStep client $ Play $ spChoice sp
@@ -266,7 +266,7 @@ secondGame sp = do
 type GameSchema = Endpoint "first" FirstParams .\/ Endpoint "second" SecondParams
 
 endpoints :: Contract (Last ThreadToken) GameSchema Text ()
-endpoints = (first `select` second) >> endpoints
+endpoints = awaitPromise (first `select` second) >> endpoints
   where
-    first  = endpoint @"first"  >>= firstGame
-    second = endpoint @"second" >>= secondGame
+    first  = endpoint @"first"  firstGame
+    second = endpoint @"second" secondGame

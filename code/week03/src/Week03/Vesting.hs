@@ -25,7 +25,8 @@ import           PlutusTx             (Data (..))
 import qualified PlutusTx
 import           PlutusTx.Prelude     hiding (Semigroup(..), unless)
 import           Ledger               hiding (singleton)
-import           Ledger.Constraints   as Constraints
+import           Ledger.Constraints   (TxConstraints)
+import qualified Ledger.Constraints   as Constraints
 import qualified Ledger.Typed.Scripts as Scripts
 import           Ledger.Ada           as Ada
 import           Playground.Contract  (printJson, printSchemas, ensureKnownCurrencies, stage, ToSchema)
@@ -35,7 +36,7 @@ import           Prelude              (IO, Semigroup (..), Show (..), String)
 import           Text.Printf          (printf)
 
 data VestingDatum = VestingDatum
-    { beneficiary :: PubKeyHash
+    { beneficiary :: PaymentPubKeyHash
     , deadline    :: POSIXTime
     } deriving Show
 
@@ -50,7 +51,7 @@ mkValidator dat () ctx = traceIfFalse "beneficiary's signature missing" signedBy
     info = scriptContextTxInfo ctx
 
     signedByBeneficiary :: Bool
-    signedByBeneficiary = txSignedBy info $ beneficiary dat
+    signedByBeneficiary = txSignedBy info $ unPaymentPubKeyHash $ beneficiary dat
 
     deadlineReached :: Bool
     deadlineReached = contains (from $ deadline dat) $ txInfoValidRange info
@@ -77,7 +78,7 @@ scrAddress :: Ledger.Address
 scrAddress = scriptAddress validator
 
 data GiveParams = GiveParams
-    { gpBeneficiary :: !PubKeyHash
+    { gpBeneficiary :: !PaymentPubKeyHash
     , gpDeadline    :: !POSIXTime
     , gpAmount      :: !Integer
     } deriving (Generic, ToJSON, FromJSON, ToSchema)
@@ -92,9 +93,9 @@ give gp = do
                 { beneficiary = gpBeneficiary gp
                 , deadline    = gpDeadline gp
                 }
-        tx  = mustPayToTheScript dat $ Ada.lovelaceValueOf $ gpAmount gp
+        tx  = Constraints.mustPayToTheScript dat $ Ada.lovelaceValueOf $ gpAmount gp
     ledgerTx <- submitTxConstraints typedValidator tx
-    void $ awaitTxConfirmed $ txId ledgerTx
+    void $ awaitTxConfirmed $ getCardanoTxId ledgerTx
     logInfo @String $ printf "made a gift of %d lovelace to %s with deadline %s"
         (gpAmount gp)
         (show $ gpBeneficiary gp)
@@ -103,8 +104,8 @@ give gp = do
 grab :: forall w s e. AsContractError e => Contract w s e ()
 grab = do
     now   <- currentTime
-    pkh   <- pubKeyHash <$> ownPubKey
-    utxos <- Map.filter (isSuitable pkh now) <$> utxoAt scrAddress
+    pkh   <- ownPaymentPubKeyHash
+    utxos <- Map.filter (isSuitable pkh now) <$> utxosAt scrAddress
     if Map.null utxos
         then logInfo @String $ "no gifts available"
         else do
@@ -112,26 +113,24 @@ grab = do
                 lookups = Constraints.unspentOutputs utxos  <>
                           Constraints.otherScript validator
                 tx :: TxConstraints Void Void
-                tx      = mconcat [mustSpendScriptOutput oref $ Redeemer $ PlutusTx.toData () | oref <- orefs] <>
-                          mustValidateIn (from now)
+                tx      = mconcat [Constraints.mustSpendScriptOutput oref unitRedeemer | oref <- orefs] <>
+                          Constraints.mustValidateIn (from now)
             ledgerTx <- submitTxConstraintsWith @Void lookups tx
-            void $ awaitTxConfirmed $ txId ledgerTx
+            void $ awaitTxConfirmed $ getCardanoTxId ledgerTx
             logInfo @String $ "collected gifts"
   where
-    isSuitable :: PubKeyHash -> POSIXTime -> TxOutTx -> Bool
-    isSuitable pkh now o = case txOutDatumHash $ txOutTxOut o of
-        Nothing -> False
-        Just h  -> case Map.lookup h $ txData $ txOutTxTx o of
-            Nothing        -> False
-            Just (Datum e) -> case PlutusTx.fromData e of
-                Nothing -> False
-                Just d  -> beneficiary d == pkh && deadline d <= now
+    isSuitable :: PaymentPubKeyHash -> POSIXTime -> ChainIndexTxOut -> Bool
+    isSuitable pkh now o = case _ciTxOutDatum o of
+        Left _          -> False
+        Right (Datum e) -> case PlutusTx.fromBuiltinData e of
+            Nothing -> False
+            Just d  -> beneficiary d == pkh && deadline d <= now
 
 endpoints :: Contract () VestingSchema Text ()
-endpoints = (give' `select` grab') >> endpoints
+endpoints = awaitPromise (give' `select` grab') >> endpoints
   where
-    give' = endpoint @"give" >>= give
-    grab' = endpoint @"grab" >>  grab
+    give' = endpoint @"give" give
+    grab' = endpoint @"grab" $ const grab
 
 mkSchemaDefinitions ''VestingSchema
 

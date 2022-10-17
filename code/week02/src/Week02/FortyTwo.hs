@@ -17,6 +17,7 @@ import           Data.Void           (Void)
 import           Plutus.Contract
 import           PlutusTx            (Data (..))
 import qualified PlutusTx
+import qualified PlutusTx.Builtins   as Builtins
 import           PlutusTx.Prelude    hiding (Semigroup(..), unless)
 import           Ledger              hiding (singleton)
 import           Ledger.Constraints  as Constraints
@@ -31,10 +32,10 @@ import           Text.Printf         (printf)
 {-# OPTIONS_GHC -fno-warn-unused-imports #-}
 
 {-# INLINABLE mkValidator #-}
-mkValidator :: Data -> Data -> Data -> ()
+mkValidator :: BuiltinData -> BuiltinData -> BuiltinData -> ()
 mkValidator _ r _
-    | r == I 42 = ()
-    | otherwise = traceError "wrong redeemer"
+    | r == Builtins.mkI 42 = ()
+    | otherwise            = traceError "wrong redeemer!"
 
 validator :: Validator
 validator = mkValidatorScript $$(PlutusTx.compile [|| mkValidator ||])
@@ -51,28 +52,28 @@ type GiftSchema =
 
 give :: AsContractError e => Integer -> Contract w s e ()
 give amount = do
-    let tx = mustPayToOtherScript valHash (Datum $ Constr 0 []) $ Ada.lovelaceValueOf amount
+    let tx = mustPayToOtherScript valHash (Datum $ Builtins.mkI 0) $ Ada.lovelaceValueOf amount
     ledgerTx <- submitTx tx
-    void $ awaitTxConfirmed $ txId ledgerTx
+    void $ awaitTxConfirmed $ getCardanoTxId ledgerTx
     logInfo @String $ printf "made a gift of %d lovelace" amount
 
 grab :: forall w s e. AsContractError e => Integer -> Contract w s e ()
 grab n = do
-    utxos <- utxoAt scrAddress
+    utxos <- utxosAt scrAddress
     let orefs   = fst <$> Map.toList utxos
         lookups = Constraints.unspentOutputs utxos      <>
                   Constraints.otherScript validator
         tx :: TxConstraints Void Void
-        tx      = mconcat [mustSpendScriptOutput oref $ Redeemer $ I n | oref <- orefs]
+        tx      = mconcat [mustSpendScriptOutput oref $ Redeemer $ Builtins.mkI n | oref <- orefs]
     ledgerTx <- submitTxConstraintsWith @Void lookups tx
-    void $ awaitTxConfirmed $ txId ledgerTx
+    void $ awaitTxConfirmed $ getCardanoTxId ledgerTx
     logInfo @String $ "collected gifts"
 
 endpoints :: Contract () GiftSchema Text ()
-endpoints = (give' `select` grab') >> endpoints
+endpoints = awaitPromise (give' `select` grab') >> endpoints
   where
-    give' = endpoint @"give" >>= give
-    grab' = endpoint @"grab" >>= grab
+    give' = endpoint @"give" give
+    grab' = endpoint @"grab" grab
 
 mkSchemaDefinitions ''GiftSchema
 

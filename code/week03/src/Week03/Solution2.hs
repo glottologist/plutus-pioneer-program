@@ -11,8 +11,6 @@
 {-# LANGUAGE TypeFamilies          #-}
 {-# LANGUAGE TypeOperators         #-}
 
-{-# OPTIONS_GHC -fno-warn-unused-imports #-}
-
 module Week03.Solution2 where
 
 import           Control.Monad        hiding (fmap)
@@ -25,17 +23,20 @@ import           Plutus.Contract
 import qualified PlutusTx
 import           PlutusTx.Prelude     hiding (Semigroup(..), unless)
 import           Ledger               hiding (singleton)
-import           Ledger.Constraints   as Constraints
+import           Ledger.Constraints   (TxConstraints)
+import qualified Ledger.Constraints   as Constraints
 import qualified Ledger.Typed.Scripts as Scripts
 import           Ledger.Ada           as Ada
 import           Playground.Contract  (printJson, printSchemas, ensureKnownCurrencies, stage, ToSchema)
 import           Playground.TH        (mkKnownCurrencies, mkSchemaDefinitions)
 import           Playground.Types     (KnownCurrency (..))
-import           Prelude              (IO, Semigroup (..), Show (..), String)
+import           Prelude              (IO, Semigroup (..), Show (..), String, undefined)
 import           Text.Printf          (printf)
 
+{-# OPTIONS_GHC -fno-warn-unused-imports #-}
+
 {-# INLINABLE mkValidator #-}
-mkValidator :: PubKeyHash -> POSIXTime -> () -> ScriptContext -> Bool
+mkValidator :: PaymentPubKeyHash -> POSIXTime -> () -> ScriptContext -> Bool
 mkValidator pkh s () ctx =
     traceIfFalse "beneficiary's signature missing" checkSig      &&
     traceIfFalse "deadline not reached"            checkDeadline
@@ -44,7 +45,7 @@ mkValidator pkh s () ctx =
     info = scriptContextTxInfo ctx
 
     checkSig :: Bool
-    checkSig = pkh `elem` txInfoSignatories info
+    checkSig = unPaymentPubKeyHash pkh `elem` txInfoSignatories info
 
     checkDeadline :: Bool
     checkDeadline = from s `contains` txInfoValidRange info
@@ -54,21 +55,21 @@ instance Scripts.ValidatorTypes Vesting where
     type instance DatumType Vesting = POSIXTime
     type instance RedeemerType Vesting = ()
 
-typedValidator :: PubKeyHash -> Scripts.TypedValidator Vesting
+typedValidator :: PaymentPubKeyHash -> Scripts.TypedValidator Vesting
 typedValidator p = Scripts.mkTypedValidator @Vesting
     ($$(PlutusTx.compile [|| mkValidator ||]) `PlutusTx.applyCode` PlutusTx.liftCode p)
     $$(PlutusTx.compile [|| wrap ||])
   where
     wrap = Scripts.wrapValidator @POSIXTime @()
 
-validator :: PubKeyHash -> Validator
+validator :: PaymentPubKeyHash -> Validator
 validator = Scripts.validatorScript . typedValidator
 
-scrAddress :: PubKeyHash -> Ledger.Address
+scrAddress :: PaymentPubKeyHash -> Ledger.Address
 scrAddress = scriptAddress . validator
 
 data GiveParams = GiveParams
-    { gpBeneficiary :: !PubKeyHash
+    { gpBeneficiary :: !PaymentPubKeyHash
     , gpDeadline    :: !POSIXTime
     , gpAmount      :: !Integer
     } deriving (Generic, ToJSON, FromJSON, ToSchema)
@@ -81,9 +82,9 @@ give :: AsContractError e => GiveParams -> Contract w s e ()
 give gp = do
     let p  = gpBeneficiary gp
         d  = gpDeadline gp
-        tx = mustPayToTheScript d $ Ada.lovelaceValueOf $ gpAmount gp
+        tx = Constraints.mustPayToTheScript d $ Ada.lovelaceValueOf $ gpAmount gp
     ledgerTx <- submitTxConstraints (typedValidator p) tx
-    void $ awaitTxConfirmed $ txId ledgerTx
+    void $ awaitTxConfirmed $ getCardanoTxId ledgerTx
     logInfo @String $ printf "made a gift of %d lovelace to %s with deadline %s"
         (gpAmount gp)
         (show $ gpBeneficiary gp)
@@ -92,8 +93,8 @@ give gp = do
 grab :: forall w s e. AsContractError e => Contract w s e ()
 grab = do
     now   <- currentTime
-    pkh   <- pubKeyHash <$> ownPubKey
-    utxos <- Map.filter (isSuitable now) <$> utxoAt (scrAddress pkh)
+    pkh   <- ownPaymentPubKeyHash
+    utxos <- Map.filter (isSuitable now) <$> utxosAt (scrAddress pkh)
     if Map.null utxos
         then logInfo @String $ "no gifts available"
         else do
@@ -101,26 +102,24 @@ grab = do
                 lookups = Constraints.unspentOutputs utxos        <>
                           Constraints.otherScript (validator pkh)
                 tx :: TxConstraints Void Void
-                tx      = mconcat [mustSpendScriptOutput oref $ Redeemer $ PlutusTx.toData () | oref <- orefs] <>
-                          mustValidateIn (from now)
+                tx      = mconcat [Constraints.mustSpendScriptOutput oref unitRedeemer | oref <- orefs] <>
+                          Constraints.mustValidateIn (from now)
             ledgerTx <- submitTxConstraintsWith @Void lookups tx
-            void $ awaitTxConfirmed $ txId ledgerTx
+            void $ awaitTxConfirmed $ getCardanoTxId ledgerTx
             logInfo @String $ "collected gifts"
   where
-    isSuitable :: POSIXTime -> TxOutTx -> Bool
-    isSuitable now o = case txOutDatumHash $ txOutTxOut o of
-        Nothing -> False
-        Just h  -> case Map.lookup h $ txData $ txOutTxTx o of
-            Nothing        -> False
-            Just (Datum e) -> case PlutusTx.fromData e of
-                Nothing -> False
-                Just d  -> d <= now
+    isSuitable :: POSIXTime -> ChainIndexTxOut -> Bool
+    isSuitable now o = case _ciTxOutDatum o of
+        Left _          -> False
+        Right (Datum e) -> case PlutusTx.fromBuiltinData e of
+            Nothing -> False
+            Just d  -> d <= now
 
 endpoints :: Contract () VestingSchema Text ()
-endpoints = (give' `select` grab') >> endpoints
+endpoints = awaitPromise (give' `select` grab') >> endpoints
   where
-    give' = endpoint @"give" >>= give
-    grab' = endpoint @"grab" >>  grab
+    give' = endpoint @"give" give
+    grab' = endpoint @"grab" $ const grab
 
 mkSchemaDefinitions ''VestingSchema
 

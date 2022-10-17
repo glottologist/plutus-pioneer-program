@@ -24,9 +24,6 @@ import           Ledger                 hiding (mint, singleton)
 import           Ledger.Constraints     as Constraints
 import qualified Ledger.Typed.Scripts   as Scripts
 import           Ledger.Value           as Value
-import           Playground.Contract    (printJson, printSchemas, ensureKnownCurrencies, stage, ToSchema)
-import           Playground.TH          (mkKnownCurrencies, mkSchemaDefinitions)
-import           Playground.Types       (KnownCurrency (..))
 import           Prelude                (IO, Semigroup (..), Show (..), String, undefined)
 import           Text.Printf            (printf)
 import           Wallet.Emulator.Wallet
@@ -43,24 +40,22 @@ policy oref = undefined -- IMPLEMENT ME!
 curSymbol :: TxOutRef -> CurrencySymbol
 curSymbol = undefined -- IMPLEMENT ME!
 
-type NFTSchema = Endpoint "mint" ()
+type NFTSchema = Endpoint "mint" Address
 
-mint :: Contract w NFTSchema Text ()
-mint = undefined -- IMPLEMENT ME!
+mint :: Address -> Contract w NFTSchema Text ()
+mint _ = undefined -- IMPLEMENT ME!
 
 endpoints :: Contract () NFTSchema Text ()
 endpoints = mint' >> endpoints
   where
-    mint' = endpoint @"mint" >> mint
-
-mkSchemaDefinitions ''NFTSchema
-
-mkKnownCurrencies []
+    mint' = awaitPromise $ endpoint @"mint" mint
 
 test :: IO ()
 test = runEmulatorTraceIO $ do
-    h1 <- activateContractWallet (Wallet 1) endpoints
-    h2 <- activateContractWallet (Wallet 2) endpoints
-    callEndpoint @"mint" h1 ()
-    callEndpoint @"mint" h2 ()
+    let w1 = knownWallet 1
+        w2 = knownWallet 2
+    h1 <- activateContractWallet w1 endpoints
+    h2 <- activateContractWallet w2 endpoints
+    callEndpoint @"mint" h1 $ mockWalletAddress w1
+    callEndpoint @"mint" h2 $ mockWalletAddress w2
     void $ Emulator.waitNSlots 1
